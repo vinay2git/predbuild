@@ -1,0 +1,381 @@
+package com.vmware.scan.collector.vrcs.restcalls;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.MalformedURLException;
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.http.HttpResponse;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.log4j.Logger;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import com.vmware.scan.collector.gerrit.restcalls.GerritDataFileReader;
+import com.vmware.scan.collector.main.pojos.CLFile;
+import com.vmware.scan.collector.main.pojos.ChangeListDetails;
+import com.vmware.scan.collector.main.pojos.StageDetails;
+import com.vmware.scan.collector.main.pojos.SuiteDetails;
+import com.vmware.scan.collector.main.pojos.TaskDetails;
+
+public class VRCSRestApiCalls {
+	private static final String ApplicationURL = "https://vrcs.eng.vmware.com/";
+	private static final String TokenURL = "identity/api/tokens";
+	private static final String CodestreamExecutionFilterApiURL = "release-management-service/api/release-pipelines/executions?filter=";
+	private static final String CodestreamReleasePiplelineURL = "release-management-service/api/release-pipelines/";
+	private static final String CodestreamExecutionURL = "/executions/";
+	private HttpClient httpClient;
+
+	private String token;
+	private String nextLinkHREF = "";
+
+	private Logger logger = Logger.getLogger(VRCSRestApiCalls.class);
+
+	public void getConnectionToken() {
+		try {
+			httpClient = HttpClientBuilder.create().build();
+			String url = ApplicationURL + TokenURL;
+			HttpPost tokenRequest = new HttpPost(url);
+
+			JSONObject inputJson = new JSONObject();
+			inputJson.put("username", "vav@vmware.com");
+			inputJson.put("password", "Sathya@1580");
+			inputJson.put("tenant", "vra");
+
+			StringEntity input = new StringEntity(inputJson.toString());
+			tokenRequest.addHeader("content-type", "application/json");
+			tokenRequest.setHeader("Accept", "application/json");
+			tokenRequest.setEntity(input);
+
+			HttpResponse response = httpClient.execute(tokenRequest);
+			BufferedReader reader = new BufferedReader(new InputStreamReader(response.getEntity().getContent()));
+			String line = "";
+			StringBuilder outputData = new StringBuilder();
+			while ((line = reader.readLine()) != null) {
+				outputData.append(line);
+			}
+
+			JSONObject outputJson = new JSONObject(outputData.toString());
+			token = outputJson.getString("id");
+
+		} catch (MalformedURLException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+
+	public List<ChangeListDetails> fetchAllExecutionsWithFilter(String searchTerm, String searchType) {
+		List<ChangeListDetails> changeListDetails = new ArrayList<>();
+		try {
+			String url = ApplicationURL + CodestreamExecutionFilterApiURL
+					+ URLEncoder
+							.encode("{\"searchParams\":[{\"searchTerm\":\"vra-on-vrcs\",\"searchType\":\"PIPELINE_NAME\"}]}")
+					+ "&content=full&page=1&start=0&limit=10";
+			JSONObject outputJson = runGetCall(url);
+			changeListDetails = parseJSON(outputJson);
+		} catch (MalformedURLException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		return changeListDetails;
+	}
+
+	public List<ChangeListDetails> fetchExecutionsFromLink() {
+		List<ChangeListDetails> changeListDetails = new ArrayList<>();
+		try {
+			JSONObject outputJson = runGetCall(nextLinkHREF);
+			changeListDetails = parseJSON(outputJson);
+		} catch (MalformedURLException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		return changeListDetails;
+	}
+
+	public JSONObject runGetCall(String url) throws ClientProtocolException, IOException {
+		JSONObject outputJson = null;
+
+		httpClient = HttpClientBuilder.create().build();
+		HttpGet allExecutionForaPipeline = new HttpGet(url);
+		allExecutionForaPipeline.addHeader("content-type", "application/json");
+		allExecutionForaPipeline.setHeader("Accept", "application/json");
+		String authentication = "Bearer " + token;
+		allExecutionForaPipeline.setHeader("Authorization", authentication);
+
+		HttpResponse response = httpClient.execute(allExecutionForaPipeline);
+		logger.debug("Response Code : " + response.getStatusLine().getStatusCode());
+
+		BufferedReader reader = new BufferedReader(new InputStreamReader(response.getEntity().getContent()));
+		String line;
+		StringBuilder outputData = new StringBuilder();
+
+		while ((line = reader.readLine()) != null) {
+			outputData.append(line);
+		}
+
+		outputJson = new JSONObject(outputData.toString());
+		httpClient.getConnectionManager().shutdown();
+		return outputJson;
+	}
+
+	public List<ChangeListDetails> parseJSON(JSONObject jsonToParse) {
+		fetchNextHREF(jsonToParse);
+		List<ChangeListDetails> changeListDetails = fetchContent(jsonToParse);
+		return changeListDetails;
+	}
+
+	public void fetchNextHREF(JSONObject jsonToParse) {
+		JSONArray link = jsonToParse.getJSONArray("links");
+		nextLinkHREF = "END";
+		for (int i = 0; i < link.length(); i++) {
+			JSONObject currentObject = link.getJSONObject(i);
+			if (currentObject.getString("rel").equals("next"))
+				nextLinkHREF = currentObject.getString("href");
+		}
+		logger.debug("Next Link " + nextLinkHREF);
+	}
+
+	public List<ChangeListDetails> fetchContent(JSONObject jsonToParse) {
+		List<ChangeListDetails> changeLists = new ArrayList<ChangeListDetails>();
+		JSONArray content = jsonToParse.getJSONArray("content");
+		GerritDataFileReader gerritData = new GerritDataFileReader();
+		for (int i = 0; i < content.length(); i++) {
+			ChangeListDetails currentChangeList = new ChangeListDetails();
+			JSONObject currentContentObject = content.getJSONObject(i);
+			String executionID = currentContentObject.getString("id");
+			JSONArray pipelineParams = currentContentObject.getJSONArray("pipelineParams");
+			String gerritChangeset = parseAndFetchGerritChangesetID(pipelineParams);
+			String gerritChangesetOwner = parseAndFetchGerritChangesetOwner(pipelineParams);
+			JSONObject releasePipeline = currentContentObject.getJSONObject("releasePipeline");
+			String releasePipelineID = releasePipeline.getString("id");
+			logger.debug("");
+			logger.debug("################################### Object" + (i + 1)
+					+ " ############################################");
+			logger.debug("Gerrit Changeset " + gerritChangeset);
+			currentChangeList.setChangelistID(gerritChangeset);
+
+			if (gerritChangeset.length() > 5) {
+				HashMap<String, List<CLFile>> gerritDetails = gerritData.getChangeIDDetails(gerritChangeset);
+				Iterator gerritDetailsIterator = gerritDetails.entrySet().iterator();
+				while (gerritDetailsIterator.hasNext()) {
+					Map.Entry pair = (Map.Entry) gerritDetailsIterator.next();
+					if (null != pair.getKey())
+						currentChangeList.setOwnerID(pair.getKey().toString());
+					else
+						currentChangeList.setOwnerID(null);
+					currentChangeList.setOwnerName(gerritChangesetOwner);
+					if (null != pair.getValue()) {
+						List<CLFile> listOfFilesAndChanges = (List<CLFile>) pair.getValue();
+						currentChangeList.setFiles(listOfFilesAndChanges);
+					} else {
+						currentChangeList.setFiles(null);
+					}
+				}
+
+				HashMap<String, List<String>> gerritReviewersDetails = gerritData.getChangeIDReviewers(gerritChangeset);
+				if (null != gerritReviewersDetails) {
+					Iterator gerritReviewersDetailsIterator = gerritReviewersDetails.entrySet().iterator();
+					while (gerritReviewersDetailsIterator.hasNext()) {
+						Map.Entry pair = (Map.Entry) gerritReviewersDetailsIterator.next();
+						if (pair.getKey().equals("+1")) {
+							if (null != pair.getValue()) {
+								currentChangeList.setPlusOneReviewers(((List<String>) pair.getValue()));
+							}
+						} else if (pair.getKey().equals("+2")) {
+							if (null != pair.getValue()) {
+								currentChangeList.setPlusTwoReviewers(((List<String>) pair.getValue()));
+							}
+						}
+					}
+				}
+			}
+			JSONArray stages = currentContentObject.getJSONArray("stages");
+			List<StageDetails> stageDetails = parseAndFetchStages(stages);
+			currentChangeList.setStages(stageDetails);
+			changeLists.add(currentChangeList);
+		}
+		logger.debug("##########################################################");
+		return changeLists;
+	}
+
+	public String parseAndFetchGerritChangesetID(JSONArray pipelineParamsObject) {
+		String changeSet = "";
+		for (int j = 0; j < pipelineParamsObject.length(); j++) {
+			JSONObject currentPipelineParam = pipelineParamsObject.getJSONObject(j);
+			if (currentPipelineParam.getString("name").equals("GERRIT_CHANGE_ID"))
+				changeSet = currentPipelineParam.getString("value");
+		}
+		return changeSet;
+	}
+
+	public String parseAndFetchGerritChangesetOwner(JSONArray pipelineParamsObject) {
+		String changeSetOwner = "";
+		for (int j = 0; j < pipelineParamsObject.length(); j++) {
+			JSONObject currentPipelineParam = pipelineParamsObject.getJSONObject(j);
+			if (currentPipelineParam.getString("name").equals("Developer"))
+				changeSetOwner = currentPipelineParam.getString("value");
+		}
+		return changeSetOwner;
+	}
+
+	public List<StageDetails> parseAndFetchStages(JSONArray stages) {
+		logger.debug("=================================================================");
+		logger.debug("Stage Length " + stages.length());
+		List<TaskDetails> taskDetails = new ArrayList<TaskDetails>();
+		List<StageDetails> stageDetails = new ArrayList<StageDetails>();
+		for (int k = 0; k < stages.length(); k++) {
+			StageDetails currentStageDetails = new StageDetails();
+			JSONObject currentStage = stages.getJSONObject(k);
+			String stageName = currentStage.getString("name");
+			JSONArray tasks = currentStage.getJSONArray("tasks");
+			if (stageName.equals("Gerrit") || stageName.equals("BAT") || stageName.equals("Regression Tests")) {
+				currentStageDetails.setStageName(stageName);
+				taskDetails = parseAndFetchTasks(stageName, tasks);
+				currentStageDetails.setTasks(taskDetails);
+				stageDetails.add(currentStageDetails);
+			}
+		}
+		return stageDetails;
+	}
+
+	public List<TaskDetails> parseAndFetchTasks(String name, JSONArray tasks) {
+		List<TaskDetails> taskDetails = new ArrayList<TaskDetails>();
+		HashMap<String, String> tempTaskAndStatus = new HashMap<>();
+		Boolean flagID = false;
+		String taskPipelineID = null;
+		String taskPipelineExecutionID = null;
+		logger.debug("Stage Name " + name);
+		logger.debug("-------------------------------------------------------------------");
+		logger.debug("Tasks Length " + tasks.length());
+		if (name.equals("BAT") || name.equals("Regression Tests"))
+			flagID = true;
+		for (int l = 0; l < tasks.length(); l++) {
+			List<SuiteDetails> suites = new ArrayList<SuiteDetails>();
+			TaskDetails currentTaskDetails = new TaskDetails();
+			JSONObject currentTask = tasks.getJSONObject(l);
+			JSONObject executionInfo = currentTask.getJSONObject("executionInfo");
+			if (flagID) {
+				String currentTaskString = currentTask.toString();
+				logger.debug(currentTaskString);
+				int indexOfPipelineID = currentTaskString
+						.indexOf("{\\\"name\\\":\\\"pipelineId\\\",\\\"type\\\":\\\"String\\\",\\\"value\\\":\\\"");
+				indexOfPipelineID += 57;
+				taskPipelineID = currentTaskString.substring(indexOfPipelineID, (indexOfPipelineID + 36));
+				logger.debug("Task Pipeline ID : " + taskPipelineID);
+				int indexOfPipelineExecutionID = currentTaskString.indexOf(
+						"\\\"name\\\":\\\"pipelineExecutionId\\\",\\\"type\\\":\\\"String\\\",\\\"value\\\":\\\"");
+				indexOfPipelineExecutionID += 65;
+				taskPipelineExecutionID = currentTaskString.substring(indexOfPipelineExecutionID,
+						(indexOfPipelineExecutionID + 36));
+				logger.debug("Task Pipeline Execution ID : " + taskPipelineExecutionID);
+			}
+			String taskStatus = executionInfo.getString("status");
+			JSONObject task = currentTask.getJSONObject("task");
+			String taskName = task.getString("name");
+			tempTaskAndStatus.put(taskName, taskStatus);
+			logger.debug("Task Name " + taskName);
+			logger.debug("Task Status " + taskStatus);
+			if (!taskName.equals("Gating Rule")) {
+				currentTaskDetails.setTaskName(taskName);
+				currentTaskDetails.setTaskStatus(taskStatus);
+				if (flagID) {
+					suites = fetchIndividualSuiteStatus(taskStatus, taskPipelineID, taskPipelineExecutionID);
+					currentTaskDetails.setSuites(suites);
+				}
+				taskDetails.add(currentTaskDetails);
+			}
+		}
+		logger.debug("-------------------------------------------------------------------");
+		return taskDetails;
+	}
+
+	public List<SuiteDetails> fetchIndividualSuiteStatus(String taskStatus, String pipelineID,
+			String pipelineExecutionID) {
+		List<SuiteDetails> suites = new ArrayList<SuiteDetails>();
+		if (taskStatus.equals("NOT_STARTED")) {
+
+		} else if (taskStatus.equals("IN_PROGRESS")) {
+
+		} else {
+			try {
+				if (pipelineID.toLowerCase().contains("vra") || pipelineID.toLowerCase().contains("builder")
+						|| pipelineExecutionID.toLowerCase().contains("pipeline")) {
+					return null;
+				}
+				String url = ApplicationURL + CodestreamReleasePiplelineURL + pipelineID + CodestreamExecutionURL
+						+ pipelineExecutionID;
+				System.out.println("Suite URL " + url);
+				JSONObject outputJson = runGetCall(url);
+				JSONArray stages = outputJson.getJSONArray("stages");
+				suites = parseAndFetchSuiteStages(stages);
+
+			} catch (MalformedURLException e) {
+				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+		return suites;
+	}
+
+	public List<SuiteDetails> parseAndFetchSuiteStages(JSONArray stages) {
+		List<SuiteDetails> suites = new ArrayList<SuiteDetails>();
+		logger.debug("***********************************************************************");
+		for (int m = 0; m < stages.length(); m++) {
+			JSONObject currentStage = stages.getJSONObject(m);
+			String stageName = currentStage.getString("name");
+			JSONArray tasks = currentStage.getJSONArray("tasks");
+			suites = parseAndFetchSuiteTasks(stageName, tasks);
+		}
+		logger.debug("***********************************************************************");
+		return suites;
+	}
+
+	public List<SuiteDetails> parseAndFetchSuiteTasks(String name, JSONArray tasks) {
+		List<SuiteDetails> suites = new ArrayList<SuiteDetails>();
+		for (int n = 0; n < tasks.length(); n++) {
+			SuiteDetails currentSuiteDetails = new SuiteDetails();
+			JSONObject currentTask = tasks.getJSONObject(n);
+			JSONObject executionInfo = currentTask.getJSONObject("executionInfo");
+			String suiteStatus = executionInfo.getString("status");
+			JSONObject suite = currentTask.getJSONObject("task");
+			String suiteName = suite.getString("name");
+			logger.debug("Suite Name " + suiteName);
+			logger.debug("Suite Status " + suiteStatus);
+			currentSuiteDetails.setSuiteName(suiteName);
+			currentSuiteDetails.setSuiteStatus(suiteStatus);
+			suites.add(currentSuiteDetails);
+		}
+		return suites;
+	}
+
+	public String getToken() {
+		return token;
+	}
+
+	public void setToken(String token) {
+		this.token = token;
+	}
+
+	public String getNextLinkHREF() {
+		return nextLinkHREF;
+	}
+
+	public void setNextLinkHREF(String nextLinkHREF) {
+		this.nextLinkHREF = nextLinkHREF;
+	}
+}
